@@ -1,0 +1,144 @@
+# -*- coding: utf-8 -*-
+"""
+ArUco 实时位姿跟踪
+用法: python aruco_tracker.py
+前置: 先运行 calibrate.py 生成 camera_params.npz，并用 generate_marker.py 打印 ArUco 码
+操作: [q] 退出
+输出: 画面上画坐标轴，终端打印每个 ArUco 码的 ID、距离(mm)、姿态角
+"""
+import cv2 as cv
+import numpy as np
+import os
+import sys
+import time
+from hik_camera import HikCamera
+
+# === 参数 ===
+DICT = cv.aruco.DICT_6X6_250
+MARKER_SIZE_MM = 50.0   # 打印的 ArUco 码实际边长（毫米）
+# ============
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PARAMS_FILE = os.path.join(SCRIPT_DIR, "camera_params.npz")
+
+if not os.path.exists(PARAMS_FILE):
+    print(f"[错误] 找不到 {PARAMS_FILE}")
+    print("请先运行: python calibrate.py")
+    sys.exit(1)
+
+data = np.load(PARAMS_FILE)
+K = data["K"]
+d = data["d"]
+print(f"[加载] 内参 K=\n{K}")
+print(f"[加载] 畸变 d=\n{d.ravel()}")
+
+dictionary = cv.aruco.getPredefinedDictionary(DICT)
+detector = cv.aruco.ArucoDetector(dictionary, cv.aruco.DetectorParameters())
+
+
+def draw_axis(img, corner, img_pts):
+    """画 XYZ 坐标轴: X红 Y绿 Z蓝"""
+    origin = tuple(corner[0].astype(int))
+    img = cv.line(img, origin, tuple(img_pts[0][0].astype(int)), (0, 0, 255), 2)   # X
+    img = cv.line(img, origin, tuple(img_pts[1][0].astype(int)), (0, 255, 0), 2)   # Y
+    img = cv.line(img, origin, tuple(img_pts[2][0].astype(int)), (255, 0, 0), 2)   # Z
+    return img
+
+
+def rotation_vector_to_euler(rvec):
+    """旋转向量 → 欧拉角 (度)"""
+    R, _ = cv.Rodrigues(rvec)
+    sy = np.sqrt(R[0, 0]**2 + R[1, 0]**2)
+    singular = sy < 1e-6
+    if not singular:
+        x = np.arctan2(R[2, 1], R[2, 2])
+        y = np.arctan2(-R[2, 0], sy)
+        z = np.arctan2(R[1, 0], R[0, 0])
+    else:
+        x = np.arctan2(-R[1, 2], R[1, 1])
+        y = np.arctan2(-R[2, 0], sy)
+        z = 0
+    return np.degrees([x, y, z])
+
+
+def main():
+    cam = HikCamera(dev_index=0)
+    cam.open()
+    cam.start_grabbing()
+
+    print("\n=== ArUco 跟踪中 ===")
+    print("画面: X=红 Y=绿 Z=蓝\n")
+
+    t_prev = time.time()
+    fps = 0
+
+    while True:
+        frame = cam.get_frame()
+        if frame is None:
+            continue
+
+        # 检测 ArUco
+        corners, ids, rejected = detector.detectMarkers(frame)
+
+        vis = cv.cvtColor(frame, cv.COLOR_GRAY2BGR)
+
+        if ids is not None and len(ids) > 0:
+            cv.aruco.drawDetectedMarkers(vis, corners, ids)
+
+            # 定义单个ArUco码的3D物理角点坐标（单位mm）
+            half = MARKER_SIZE_MM / 2
+            obj_pts = np.float32([
+                [-half,  half, 0],
+                [ half,  half, 0],
+                [ half, -half, 0],
+                [-half, -half, 0]
+            ])
+
+            for i, mid in enumerate(ids.flatten()):
+                # 用solvePnP估计位姿，兼容OpenCV 5.0（旧estimatePoseSingleMarkers已废弃）
+                ret, rvec, tvec = cv.solvePnP(obj_pts, corners[i], K, d, flags=cv.SOLVEPNP_IPPE_SQUARE)
+                tvec = tvec.ravel()  # mm
+
+                # 画坐标轴
+                img_pts, _ = cv.projectPoints(
+                    np.float32([[0, 0, 0],
+                                [MARKER_SIZE_MM, 0, 0],
+                                [0, MARKER_SIZE_MM, 0],
+                                [0, 0, MARKER_SIZE_MM]]),
+                    rvec, tvec, K, d)
+                vis = draw_axis(vis, corners[i][0], img_pts)
+
+                # 把ID和距离画在画面上
+                euler = rotation_vector_to_euler(rvec)
+                dist = np.linalg.norm(tvec)
+                text_pos = tuple(corners[i][0][0].astype(int))
+                cv.putText(vis, f"ID:{mid}", (text_pos[0], text_pos[1]-10),
+                           cv.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 2)
+                cv.putText(vis, f"{dist:.0f}mm", (text_pos[0], text_pos[1]-30),
+                           cv.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 2)
+
+                # 终端打印详细参数
+                print(f"ID={mid:3d} | "
+                      f"X={tvec[0]:+7.1f}mm Y={tvec[1]:+7.1f}mm Z={tvec[2]:+7.1f}mm "
+                      f"| 距离={dist:6.1f}mm "
+                      f"| 俯仰={euler[0]:+6.1f}° 横滚={euler[1]:+6.1f}° 偏航={euler[2]:+6.1f}°")
+
+        # FPS
+        t_now = time.time()
+        dt = t_now - t_prev
+        if dt > 0:
+            fps = 0.9 * fps + 0.1 * (1.0 / dt)
+        t_prev = t_now
+        cv.putText(vis, f"FPS: {fps:.1f}", (10, 30),
+                   cv.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
+        cv.imshow("ArUco Tracker", vis)
+        if cv.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cam.close()
+    cv.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()

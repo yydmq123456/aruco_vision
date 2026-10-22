@@ -1,0 +1,114 @@
+# -*- coding: utf-8 -*-
+"""
+相机标定脚本
+用法: python calibrate.py
+操作:
+  1. 把棋盘格标定板贴在硬纸板上
+  2. 对着相机，按【空格】采集一张（要不同角度/距离/位置，拍 15~20 张）
+  3. 按【c】开始标定
+  4. 按【q】退出
+输出: camera_params.npz（内参矩阵 K 和畸变系数 d）
+"""
+import cv2 as cv
+import numpy as np
+import os
+import sys
+from hik_camera import HikCamera
+
+# === 标定板参数 ===
+BOARD_COLS = 9      # 内角点列数（横向黑白格数-1）
+BOARD_ROWS = 6      # 内角点行数（纵向黑白格数-1）
+SQUARE_SIZE_MM = 20.0   # 每个方格物理边长（毫米）
+# ==================
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+IMG_DIR = os.path.join(SCRIPT_DIR, "calib_images")
+OUT_FILE = os.path.join(SCRIPT_DIR, "camera_params.npz")
+os.makedirs(IMG_DIR, exist_ok=True)
+
+# 准备角点检测的 criteria
+criteria = (cv.TERM_CRITERIA_EPS + cv.TERM_CRITERIA_MAX_ITER, 30, 0.001)
+
+# 准备棋盘格三维点坐标 (0,0,0), (1,0,0), (2,0,0) ...
+objp = np.zeros((BOARD_COLS * BOARD_ROWS, 3), np.float32)
+objp[:, :2] = np.mgrid[0:BOARD_COLS, 0:BOARD_ROWS].T.reshape(-1, 2)
+objp *= SQUARE_SIZE_MM  # 单位毫米
+
+obj_points = []   # 3d 点
+img_points = []   # 2d 角点
+img_shape = None
+n_saved = 0
+
+
+def main():
+    global n_saved, img_shape
+    cam = HikCamera(dev_index=0)
+    try:
+        cam.open()
+        cam.start_grabbing()
+    except Exception as e:
+        print(f"[错误] {e}")
+        sys.exit(1)
+
+    print("\n=== 标定模式 ===")
+    print("操作: [空格] 采集 | [c] 开始标定 | [q] 退出\n")
+
+    while True:
+        frame = cam.get_frame()
+        if frame is None:
+            continue
+        img_shape = frame.shape[::-1]  # (w, h)
+
+        # 画提示
+        vis = cv.cvtColor(frame, cv.COLOR_GRAY2BGR)
+        cv.putText(vis, f"saved: {n_saved}", (10, 30),
+                   cv.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
+        # 检测棋盘格角点
+        found, corners = cv.findChessboardCorners(
+            frame, (BOARD_COLS, BOARD_ROWS),
+            cv.CALIB_CB_ADAPTIVE_THRESH + cv.CALIB_CB_FAST_CHECK)
+
+        if found:
+            cv.drawChessboardCorners(vis, (BOARD_COLS, BOARD_ROWS), corners, found)
+
+        cv.imshow("calibrate", vis)
+        key = cv.waitKey(1) & 0xFF
+
+        if key == ord(' '):
+            if found:
+                obj_points.append(objp)
+                # 亚像素细化
+                corners2 = cv.cornerSubPix(frame, corners, (11, 11), (-1, -1), criteria)
+                img_points.append(corners2)
+                n_saved += 1
+                fname = os.path.join(IMG_DIR, f"img_{n_saved:02d}.png")
+                # imencode 绕过中文路径写入问题
+                success, buffer = cv.imencode('.png', frame)
+                if success:
+                    buffer.tofile(fname)
+                print(f"  已采集 {n_saved} 张: {fname}")
+            else:
+                print("  [警告] 没检测到棋盘格，调整位置/角度/光照")
+        elif key == ord('c'):
+            if n_saved < 5:
+                print(f"  [警告] 至少采集 5 张，当前 {n_saved} 张")
+                continue
+            print(f"\n开始标定，共 {n_saved} 张...")
+            ret, K, d, rvecs, tvecs = cv.calibrateCamera(
+                obj_points, img_points, img_shape, None, None)
+            print(f"重投影误差: {ret:.4f} 像素")
+            print(f"内参矩阵 K:\n{K}")
+            print(f"畸变系数 d:\n{d.ravel()}")
+            np.savez(OUT_FILE, K=K, d=d, img_size=img_shape,
+                     square_size=SQUARE_SIZE_MM)
+            print(f"\n已保存到: {OUT_FILE}")
+        elif key == ord('q'):
+            break
+
+    cam.close()
+    cv.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
